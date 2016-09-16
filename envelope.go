@@ -9,6 +9,7 @@ import (
 	"net/mail"
 	"strconv"
 	"strings"
+	"time"
 
 	enmime "github.com/jhillyerd/go.enmime"
 	"github.com/nycmonkey/tika"
@@ -18,6 +19,7 @@ import (
 type Metadata struct {
 	Sender, OnBehalfOf, Subject, MessageID string   `json:",omitempty"`
 	To, CC, BCC                            []string `json:",omitempty"`
+	JournalTimestamp                       time.Time
 }
 
 // Message holds the details of a journaled message
@@ -37,6 +39,13 @@ func Parse(in io.Reader) (m *Message, err error) {
 	if err != nil {
 		return
 	}
+
+	// it parsed, so capture the timestamp from the envelope
+	received, err := env.Header.Date()
+	if err != nil {
+		return nil, err
+	}
+
 	// it parsed, so parse the body as a MIME message
 	b, err := enmime.ParseMIMEBody(env)
 	if err != nil {
@@ -79,6 +88,7 @@ func Parse(in io.Reader) (m *Message, err error) {
 	if err != nil {
 		return
 	}
+	md.JournalTimestamp = received
 	m = &Message{
 		Metadata: md,
 		BodyText: string(data),
@@ -98,19 +108,19 @@ func ParseBody(b string) (m *Metadata, err error) {
 		}
 		switch k {
 		case "Sender":
-			m.Sender = v
+			m.Sender = strings.ToLower(v)
 		case "On-Behalf-Of":
 			m.OnBehalfOf = v
 		case "Subject":
 			m.Subject = v
 		case "Message-Id":
-			m.MessageID = v
+			m.MessageID = strings.TrimSuffix(strings.TrimPrefix(v, "<"), ">")
 		case "Recipient", "To":
-			m.To = append(m.To, strings.Split(v, " Expanded: ")...)
+			m.To = appendUniq(m.To, strings.Split(v, " Expanded: ")...)
 		case "Cc":
-			m.CC = append(m.CC, strings.Split(v, " Expanded: ")...)
+			m.CC = appendUniq(m.CC, strings.Split(v, " Expanded: ")...)
 		case "Bcc":
-			m.BCC = append(m.BCC, strings.Split(v, " Expanded: ")...)
+			m.BCC = appendUniq(m.BCC, strings.Split(v, " Expanded: ")...)
 		default:
 			log.Printf("Unhandled envelope header in envelope journal: %s\n", k)
 		}
@@ -124,4 +134,18 @@ func splitHeader(h string) (k, v string, ok bool) {
 		return
 	}
 	return kv[0], kv[1], true
+}
+
+func appendUniq(start []string, more ...string) []string {
+CheckExists:
+	for _, m := range more {
+		m = strings.ToLower(m)
+		for _, s := range start {
+			if m == s {
+				continue CheckExists
+			}
+		}
+		start = append(start, m)
+	}
+	return start
 }
