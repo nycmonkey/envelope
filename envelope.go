@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/mail"
@@ -12,20 +13,28 @@ import (
 	"time"
 
 	enmime "github.com/jhillyerd/go.enmime"
-	"github.com/nycmonkey/tika"
+	sha256 "github.com/minio/sha256-simd"
 )
 
 // Metadata holds key details about a message from the body of a journal envelope
 type Metadata struct {
 	Sender, OnBehalfOf, Subject, MessageID string   `json:",omitempty"`
 	To, CC, BCC                            []string `json:",omitempty"`
-	JournalTimestamp                       time.Time
+	Timestamp                              time.Time
+}
+
+// Part contains the key bits of a MIME part
+type Part struct {
+	FileName, ContentType, SHA256 string
+	Content                       []byte
 }
 
 // Message holds the details of a journaled message
 type Message struct {
 	*Metadata
-	BodyText string
+	SHA256 string
+	Body   string
+	Parts  []*Part
 }
 
 // Parse reads an email in a journaled envelope, and returns the parsed data
@@ -61,40 +70,47 @@ func Parse(in io.Reader) (m *Message, err error) {
 		err = errors.New("Expected 1 MIME message in the envolope, but got " + strconv.Itoa(len(b.OtherParts)))
 		return
 	}
-	r := bytes.NewReader(b.OtherParts[0].Content())
-	m2, err := mail.ReadMessage(r)
-	if err != nil {
-		log.Fatalln(err)
-	}
 
-	// it parsed as a message, so let's process its contents
-	b2, err := enmime.ParseMIMEBody(m2)
-	if err != nil {
-		return
-	}
-
-	// the first attachment should be the body of the mail in RTF format
-	if len(b2.Attachments) < 1 {
-		err = errors.New("Expected at least one attachment, but got " + strconv.Itoa(len(b.Attachments)))
-	}
-
-	// fire up an Apache Tika instance ot do the coversion to plain text
-	t, err := tika.NewTika("http://localhost:9998/tika")
-	if err != nil {
-		return
-	}
-
-	data, err := t.Parse(bytes.NewBuffer(b2.Attachments[0].Content()), b2.Attachments[0].ContentType())
-	if err != nil {
-		return
-	}
-	md.JournalTimestamp = received
+	md.Timestamp = received
+	h := fmt.Sprintf("%x", sha256.Sum256(b.OtherParts[0].Content()))
 	m = &Message{
+		SHA256:   h,
 		Metadata: md,
-		BodyText: string(data),
+		Parts:    make([]*Part, 0),
 	}
 
+	partCollector := make(chan enmime.MIMEPart, 1)
+
+	go func() {
+		for p := range partCollector {
+			m.Parts = append(m.Parts, &Part{FileName: p.FileName(), ContentType: p.ContentType(), Content: p.Content(), SHA256: fmt.Sprintf("%x", sha256.Sum256(p.Content()))})
+		}
+	}()
+	extractParts(b.OtherParts[0], partCollector)
+	close(partCollector)
 	return
+}
+
+func extractParts(part enmime.MIMEPart, ch chan enmime.MIMEPart) {
+	for _, p := range enmime.DepthMatchAll(part, func(part enmime.MIMEPart) bool { return true }) {
+		switch p.ContentType() {
+		case `message/rfc822`:
+			m, err := mail.ReadMessage(bytes.NewReader(p.Content()))
+			if err != nil {
+				log.Fatalln("reading message/rfc822 in extractParts:", err)
+			}
+			p2, err := enmime.ParseMIMEBody(m)
+			if err != nil {
+				log.Println("enmime.ParseBODY in extractParts:", err)
+				continue
+			}
+			extractParts(p2.Root, ch)
+		case "multipart/mixed":
+			continue
+		default:
+			ch <- p
+		}
+	}
 }
 
 // ParseBody extracts key metadata about a journaled message from the envelope body
@@ -116,11 +132,24 @@ func ParseBody(b string) (m *Metadata, err error) {
 		case "Message-Id":
 			m.MessageID = strings.TrimSuffix(strings.TrimPrefix(v, "<"), ">")
 		case "Recipient", "To":
-			m.To = appendUniq(m.To, strings.Split(v, " Expanded: ")...)
+			if strings.Contains(v, ", Forwarded: ") {
+				m.To = appendUniq(m.To, strings.Split(v, ", Forwarded: ")...)
+			} else {
+				m.To = appendUniq(m.To, strings.Split(v, ", Expanded: ")...)
+			}
 		case "Cc":
-			m.CC = appendUniq(m.CC, strings.Split(v, " Expanded: ")...)
+			if strings.Contains(v, ", Forwarded: ") {
+				m.CC = appendUniq(m.CC, strings.Split(v, ", Forwarded: ")...)
+			} else {
+				m.CC = appendUniq(m.CC, strings.Split(v, ", Expanded: ")...)
+			}
 		case "Bcc":
-			m.BCC = appendUniq(m.BCC, strings.Split(v, " Expanded: ")...)
+			if strings.Contains(v, ", Forwarded: ") {
+				m.CC = appendUniq(m.CC, strings.Split(v, ", Forwarded: ")...)
+			} else {
+				m.BCC = appendUniq(m.BCC, strings.Split(v, ", Expanded: ")...)
+			}
+
 		default:
 			log.Printf("Unhandled envelope header in envelope journal: %s\n", k)
 		}
